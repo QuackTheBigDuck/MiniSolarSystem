@@ -61,8 +61,8 @@ void init_disk(Bodies& b, unsigned seed = 42) {
     std::uniform_real_distribution<double> U(0.0, 1.0);
     std::normal_distribution<double> N01(0.0, 1.0);
 
-    const double M_central = 1000.0;
-    const double m_small = 1.0 / b.n;
+    const double M_central = 100.0;
+    std::uniform_real_distribution<double> planet_mass(0.005, 0.05);
 
     // Body 0: central mass at rest
     b.m[0] = M_central;
@@ -70,11 +70,11 @@ void init_disk(Bodies& b, unsigned seed = 42) {
     b.vx[0] = b.vy[0] = b.vz[0] = 0.0;
 
     for (size_t i = 1; i < b.n; ++i) {
-        double r = 0.5 + 4.5 * std::sqrt(U(rng));  // radius in [0.5, 5]
+        double r = 0.8 + 7.2 * std::sqrt(U(rng));  // radius in [0.8, 8]
         double th = 2.0 * M_PI * U(rng);
-        double vc = std::sqrt(G * M_central / r);  // circular speed
+        b.m[i] = planet_mass(rng);
+        double vc = std::sqrt(G * (M_central + b.m[i]) / r);
 
-        b.m[i] = m_small;
         b.x[i] = r * std::cos(th);
         b.y[i] = r * std::sin(th);
         b.z[i] = 0.05 * N01(rng);  // thin disk
@@ -185,11 +185,20 @@ struct Visualization {
     Bodies& bodies;
     std::unique_ptr<double[]> x;
     std::unique_ptr<double[]> y;
+    std::unique_ptr<double[]> previous_x;
+    std::unique_ptr<double[]> previous_y;
+    std::unique_ptr<double[]> mass;
     size_t count;
     std::atomic<size_t> visible_count;
     HWND slider = nullptr;
+    HWND speed_slider = nullptr;
+    HWND zoom_slider = nullptr;
     HWND pause_button = nullptr;
     HWND count_label = nullptr;
+    HWND speed_label = nullptr;
+    HWND zoom_label = nullptr;
+    std::atomic<double> speed_multiplier = 1.0;
+    std::atomic<double> zoom = 1.0;
     std::atomic<bool> paused = false;
     std::uint64_t step = 0;
     std::mutex mutex;
@@ -201,6 +210,10 @@ void publish_positions(Visualization& view) {
     for (size_t i = 0; i < view.count; ++i) {
         view.x[i] = view.bodies.x[i];
         view.y[i] = view.bodies.y[i];
+        view.mass[i] = view.bodies.m[i];
+        view.previous_x[i] = view.x[i];
+        view.previous_y[i] = view.y[i];
+        view.mass[i] = view.bodies.m[i];
     }
 }
 
@@ -223,15 +236,39 @@ LRESULT CALLBACK visualization_window_proc(HWND hwnd, UINT message, WPARAM wPara
             SendMessage(view->slider, TBM_SETRANGEMAX, TRUE,
                         static_cast<LPARAM>(view->count));
             SendMessage(view->slider, TBM_SETPOS, TRUE, static_cast<LPARAM>(view->count));
+            view->speed_slider = CreateWindowExA(
+                0, TRACKBAR_CLASSA, "", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS,
+                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(103),
+                GetModuleHandle(nullptr), nullptr);
+            SendMessage(view->speed_slider, TBM_SETRANGE, TRUE, MAKELONG(1, 200));
+            SendMessage(view->speed_slider, TBM_SETPOS, TRUE, 100);
+            view->zoom_slider = CreateWindowExA(
+                0, TRACKBAR_CLASSA, "", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS,
+                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(104),
+                GetModuleHandle(nullptr), nullptr);
+            SendMessage(view->zoom_slider, TBM_SETRANGE, TRUE, MAKELONG(25, 200));
+            SendMessage(view->zoom_slider, TBM_SETPOS, TRUE, 100);
             view->count_label = CreateWindowExA(
                 0, "STATIC", "", WS_CHILD | WS_VISIBLE | SS_RIGHT,
                 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(101),
+                GetModuleHandle(nullptr), nullptr);
+            view->speed_label = CreateWindowExA(
+                0, "STATIC", "", WS_CHILD | WS_VISIBLE | SS_RIGHT,
+                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(105),
+                GetModuleHandle(nullptr), nullptr);
+            view->zoom_label = CreateWindowExA(
+                0, "STATIC", "", WS_CHILD | WS_VISIBLE | SS_RIGHT,
+                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(106),
                 GetModuleHandle(nullptr), nullptr);
             view->pause_button = CreateWindowExA(
                 0, "BUTTON", "Pause", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(102),
                 GetModuleHandle(nullptr), nullptr);
             SendMessage(view->count_label, WM_SETFONT,
+                        reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+            SendMessage(view->speed_label, WM_SETFONT,
+                        reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+            SendMessage(view->zoom_label, WM_SETFONT,
                         reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
             SendMessage(view->pause_button, WM_SETFONT,
                         reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
@@ -241,11 +278,21 @@ LRESULT CALLBACK visualization_window_proc(HWND hwnd, UINT message, WPARAM wPara
         case WM_SIZE: {
             const int width = LOWORD(lParam);
             const int height = HIWORD(lParam);
-            const int panel_height = 64;
+            const int panel_height = 112;
             const int padding = 18;
-            if (view != nullptr && view->slider != nullptr) {
-                MoveWindow(view->slider, padding, height - 48, width - 190, 28, TRUE);
-                MoveWindow(view->count_label, width - 165, height - 47, 80, 24, TRUE);
+            if (view != nullptr && view->slider != nullptr && width > 500) {
+                const int slider_width = (width - 180) / 3;
+                const int row_y = height - 94;
+                MoveWindow(view->slider, padding, row_y, slider_width, 28, TRUE);
+                MoveWindow(view->speed_slider, padding + slider_width + 20, row_y,
+                           slider_width, 28, TRUE);
+                MoveWindow(view->zoom_slider, padding + (slider_width + 20) * 2, row_y,
+                           slider_width, 28, TRUE);
+                MoveWindow(view->count_label, padding, height - 62, slider_width, 24, TRUE);
+                MoveWindow(view->speed_label, padding + slider_width + 20,
+                           height - 62, slider_width, 24, TRUE);
+                MoveWindow(view->zoom_label, padding + (slider_width + 20) * 2,
+                           height - 62, slider_width, 24, TRUE);
                 MoveWindow(view->pause_button, width - 78, height - 52, 62, 30, TRUE);
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
@@ -260,6 +307,23 @@ LRESULT CALLBACK visualization_window_proc(HWND hwnd, UINT message, WPARAM wPara
                 char text[64];
                 std::snprintf(text, sizeof text, "Particles: %zu", selected);
                 SetWindowTextA(view->count_label, text);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            if (view != nullptr && reinterpret_cast<HWND>(lParam) == view->speed_slider) {
+                const int selected = static_cast<int>(
+                    SendMessage(view->speed_slider, TBM_GETPOS, 0, 0));
+                view->speed_multiplier = selected / 100.0;
+                char text[64];
+                std::snprintf(text, sizeof text, "Speed: %.1fx", selected / 100.0);
+                SetWindowTextA(view->speed_label, text);
+            }
+            if (view != nullptr && reinterpret_cast<HWND>(lParam) == view->zoom_slider) {
+                const int selected = static_cast<int>(
+                    SendMessage(view->zoom_slider, TBM_GETPOS, 0, 0));
+                view->zoom = selected / 100.0;
+                char text[64];
+                std::snprintf(text, sizeof text, "Zoom: %.1fx", selected / 100.0);
+                SetWindowTextA(view->zoom_label, text);
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             return 0;
@@ -284,7 +348,7 @@ LRESULT CALLBACK visualization_window_proc(HWND hwnd, UINT message, WPARAM wPara
             HDC dc = BeginPaint(hwnd, &paint);
             RECT client;
             GetClientRect(hwnd, &client);
-            const int panel_height = 64;
+            const int panel_height = 112;
             const int canvas_height = std::max(1, static_cast<int>(client.bottom) - panel_height);
             const int width = std::max(1, static_cast<int>(client.right));
             const int height = std::max(1, static_cast<int>(client.bottom));
@@ -294,7 +358,7 @@ LRESULT CALLBACK visualization_window_proc(HWND hwnd, UINT message, WPARAM wPara
             HGDIOBJ old_bitmap = SelectObject(buffer, bitmap);
             HDC draw_dc = buffer;
 
-            HBRUSH background = CreateSolidBrush(RGB(8, 12, 24));
+            HBRUSH background = CreateSolidBrush(RGB(3, 5, 14));
             FillRect(draw_dc, &client, background);
             DeleteObject(background);
 
@@ -303,46 +367,71 @@ LRESULT CALLBACK visualization_window_proc(HWND hwnd, UINT message, WPARAM wPara
                 const double center_x = (client.right - client.left) * 0.5;
                 const double center_y = canvas_height * 0.5;
                 const double scale = std::min(static_cast<int>(client.right - client.left),
-                                              canvas_height) / 13.0;
+                                              canvas_height) / 18.0 * view->zoom.load();
 
-                HPEN grid_pen = CreatePen(PS_SOLID, 1, RGB(22, 31, 52));
-                HGDIOBJ old_pen = SelectObject(draw_dc, grid_pen);
+                HPEN orbit_pen = CreatePen(PS_SOLID, 1, RGB(18, 24, 48));
+                HGDIOBJ old_pen = SelectObject(draw_dc, orbit_pen);
                 HGDIOBJ old_brush = SelectObject(draw_dc, GetStockObject(NULL_BRUSH));
-                for (int ring = 1; ring <= 5; ++ring) {
-                    const int radius = static_cast<int>(ring * 1.0 * scale);
+                for (int ring = 2; ring <= 8; ++ring) {
+                    const int radius = static_cast<int>(ring * scale);
                     Ellipse(draw_dc, static_cast<int>(center_x) - radius,
                             static_cast<int>(center_y) - radius,
                             static_cast<int>(center_x) + radius,
                             static_cast<int>(center_y) + radius);
                 }
-                MoveToEx(draw_dc, 0, static_cast<int>(center_y), nullptr);
-                LineTo(draw_dc, client.right, static_cast<int>(center_y));
-                MoveToEx(draw_dc, static_cast<int>(center_x), 0, nullptr);
-                LineTo(draw_dc, static_cast<int>(center_x), canvas_height);
                 SelectObject(draw_dc, old_brush);
                 SelectObject(draw_dc, old_pen);
-                DeleteObject(grid_pen);
+                DeleteObject(orbit_pen);
 
-                HBRUSH particle_brush = CreateSolidBrush(RGB(80, 190, 255));
-                HBRUSH star_brush = CreateSolidBrush(RGB(255, 220, 80));
-                old_brush = SelectObject(draw_dc, particle_brush);
+                HBRUSH white_star_brush = CreateSolidBrush(RGB(240, 245, 255));
+                HBRUSH blue_star_brush = CreateSolidBrush(RGB(180, 210, 255));
+                HBRUSH orange_star_brush = CreateSolidBrush(RGB(255, 190, 100));
+                HPEN trail_pen = CreatePen(PS_SOLID, 1, RGB(35, 55, 100));
+                old_brush = SelectObject(draw_dc, white_star_brush);
 
                 const size_t visible_count = std::min(view->visible_count.load(), view->count);
                 for (size_t i = 1; i < visible_count; ++i) {
                     const int px = static_cast<int>(center_x + view->x[i] * scale);
                     const int py = static_cast<int>(center_y - view->y[i] * scale);
-                    Ellipse(draw_dc, px - 2, py - 2, px + 3, py + 3);
+                    const int previous_px = static_cast<int>(center_x + view->previous_x[i] * scale);
+                    const int previous_py = static_cast<int>(center_y - view->previous_y[i] * scale);
+                    HGDIOBJ old_particle_pen = SelectObject(draw_dc, trail_pen);
+                    MoveToEx(draw_dc, previous_px, previous_py, nullptr);
+                    LineTo(draw_dc, px, py);
+                    SelectObject(draw_dc, old_particle_pen);
+
+                    const double mass = view->mass[i];
+                    HBRUSH star_brush = (i % 5 == 0) ? orange_star_brush
+                        : (i % 3 == 0) ? blue_star_brush : white_star_brush;
+                    HGDIOBJ old_star_brush = SelectObject(draw_dc, star_brush);
+                    const int radius = std::clamp(
+                        2 + static_cast<int>(std::sqrt(mass) * 10.0), 2, 5);
+                    Ellipse(draw_dc, px - radius, py - radius, px + radius + 1, py + radius + 1);
+                    SelectObject(draw_dc, old_star_brush);
                 }
 
-                SelectObject(draw_dc, star_brush);
-                const int star_radius = 7;
-                Ellipse(draw_dc, static_cast<int>(center_x) - star_radius,
-                        static_cast<int>(center_y) - star_radius,
-                        static_cast<int>(center_x) + star_radius + 1,
-                        static_cast<int>(center_y) + star_radius + 1);
                 SelectObject(draw_dc, old_brush);
-                DeleteObject(particle_brush);
-                DeleteObject(star_brush);
+                DeleteObject(white_star_brush);
+                DeleteObject(blue_star_brush);
+                DeleteObject(orange_star_brush);
+                DeleteObject(trail_pen);
+                HBRUSH sun_glow = CreateSolidBrush(RGB(120, 55, 15));
+                HBRUSH sun = CreateSolidBrush(RGB(255, 190, 45));
+                const int glow_radius = 18;
+                const int sun_radius = 9;
+                HGDIOBJ old_sun_brush = SelectObject(draw_dc, sun_glow);
+                Ellipse(draw_dc, static_cast<int>(center_x) - glow_radius,
+                        static_cast<int>(center_y) - glow_radius,
+                        static_cast<int>(center_x) + glow_radius,
+                        static_cast<int>(center_y) + glow_radius);
+                SelectObject(draw_dc, sun);
+                Ellipse(draw_dc, static_cast<int>(center_x) - sun_radius,
+                        static_cast<int>(center_y) - sun_radius,
+                        static_cast<int>(center_x) + sun_radius,
+                        static_cast<int>(center_y) + sun_radius);
+                SelectObject(draw_dc, old_sun_brush);
+                DeleteObject(sun_glow);
+                DeleteObject(sun);
 
             }
 
@@ -374,7 +463,11 @@ LRESULT CALLBACK visualization_window_proc(HWND hwnd, UINT message, WPARAM wPara
 
 int run_visualization(Bodies& bodies, double dt, int threads) {
     Visualization view{bodies, std::make_unique<double[]>(bodies.n),
-                        std::make_unique<double[]>(bodies.n), bodies.n, bodies.n};
+                        std::make_unique<double[]>(bodies.n),
+                        std::make_unique<double[]>(bodies.n),
+                        std::make_unique<double[]>(bodies.n),
+                        std::make_unique<double[]>(bodies.n),
+                        bodies.n, bodies.n};
     publish_positions(view);
 
     std::thread simulation([&view, dt, threads] {
@@ -383,10 +476,12 @@ int run_visualization(Bodies& bodies, double dt, int threads) {
             const auto frame_start = std::chrono::steady_clock::now();
             while (view.paused && !view.stop) std::this_thread::sleep_for(std::chrono::milliseconds(20));
             if (view.stop) break;
-            step(view.bodies, dt);
+            step(view.bodies, dt * view.speed_multiplier.load());
             {
                 std::lock_guard<std::mutex> lock(view.mutex);
                 for (size_t i = 0; i < view.count; ++i) {
+                    view.previous_x[i] = view.x[i];
+                    view.previous_y[i] = view.y[i];
                     view.x[i] = view.bodies.x[i];
                     view.y[i] = view.bodies.y[i];
                 }
@@ -412,7 +507,7 @@ int run_visualization(Bodies& bodies, double dt, int threads) {
     RegisterClassA(&window_class);
 
     HWND window = CreateWindowExA(
-        WS_EX_COMPOSITED, class_name, "N-body particles", WS_OVERLAPPEDWINDOW,
+        0, class_name, "N-body particles", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 900, 900, nullptr, nullptr,
         window_class.hInstance, &view);
     if (window == nullptr) {
@@ -427,6 +522,8 @@ int run_visualization(Bodies& bodies, double dt, int threads) {
     char initial_label[64];
     std::snprintf(initial_label, sizeof initial_label, "Particles: %zu", bodies.n);
     SetWindowTextA(view.count_label, initial_label);
+    SetWindowTextA(view.speed_label, "Speed: 1.0x");
+    SetWindowTextA(view.zoom_label, "Zoom: 1.0x");
     SetTimer(window, 1, 16, nullptr);
 
     MSG message;
