@@ -21,44 +21,43 @@
 #include <commctrl.h>
 #endif
 
+// Simulation data for one central body and many orbiting bodies.
 struct Sim {
-    size_t n = 0;
-    std::unique_ptr<double[]> x, y, z, vx, vy, vz, ax, ay, az, m;
+    size_t n=0;
+    std::unique_ptr<double[]> x,y,z;
+    std::unique_ptr<double[]> vx, vy,vz, ax;
+    std::unique_ptr<double[]> ay,az,m;
 
     explicit Sim(size_t n_)
-        : n(n_),
-          x(std::make_unique<double[]>(n_)),
-          y(std::make_unique<double[]>(n_)),
-          z(std::make_unique<double[]>(n_)),
-          vx(std::make_unique<double[]>(n_)),
-          vy(std::make_unique<double[]>(n_)),
-          vz(std::make_unique<double[]>(n_)),
-          ax(std::make_unique<double[]>(n_)),
-          ay(std::make_unique<double[]>(n_)),
-          az(std::make_unique<double[]>(n_)),
-          m(std::make_unique<double[]>(n_)) {}
+      : n(n_), x(std::make_unique<double[]>(n_)),
+        y(std::make_unique<double[]>(n_)), z(std::make_unique<double[]>(n_)),
+        vx(std::make_unique<double[]>(n_)),vy(std::make_unique<double[]>(n_)),
+        vz(std::make_unique<double[]>(n_)), ax(std::make_unique<double[]>(n_)),
+        ay(std::make_unique<double[]>(n_)), az(std::make_unique<double[]>(n_)),
+        m(std::make_unique<double[]>(n_)) { }
 };
 
 constexpr double G = 1.0;
 constexpr double SOFTENING = 0.01;
 
+// Create repeatable starting positions.
 void seed(Sim& b, unsigned seed = 42) {
     std::mt19937_64 rng(seed);
-    std::uniform_real_distribution<double> U(0.0, 1.0);
+    std::uniform_real_distribution<double> U(0.0,1.0);
     std::normal_distribution<double> N01(0.0, 1.0);
 
-    const double M_central = 100.0;
+    const double M_central=100.0;
     std::uniform_real_distribution<double> planet_mass(0.005, 0.05);
 
     b.m[0] = M_central;
-    b.x[0] = b.y[0] = b.z[0] = 0.0;
+    b.x[0]=b.y[0]=b.z[0]=0.0;
     b.vx[0] = b.vy[0] = b.vz[0] = 0.0;
 
     for (size_t i = 1; i < b.n; ++i) {
-        double r = 0.8 + 7.2 * std::sqrt(U(rng));
-        double th = 2.0 * M_PI * U(rng);
+        double r=0.8+7.2*std::sqrt(U(rng));
+        double th = 2.0*M_PI*U(rng);
         b.m[i] = planet_mass(rng);
-        double vc = std::sqrt(G * (M_central + b.m[i]) / r);
+        double vc=std::sqrt(G*(M_central+b.m[i])/r);
 
         b.x[i] = r * std::cos(th);
         b.y[i] = r * std::sin(th);
@@ -69,15 +68,17 @@ void seed(Sim& b, unsigned seed = 42) {
     }
 
     double px = 0, py = 0, pz = 0, mt = 0;
-    for (size_t i = 0; i < b.n; ++i) {
+    for (size_t i=0; i<b.n; ++i) {
         px += b.m[i] * b.vx[i]; py += b.m[i] * b.vy[i]; pz += b.m[i] * b.vz[i];
         mt += b.m[i];
     }
-    for (size_t i = 0; i < b.n; ++i) {
+    for (size_t i=0;i<b.n;++i)
+    {
         b.vx[i] -= px / mt; b.vy[i] -= py / mt; b.vz[i] -= pz / mt;
     }
 }
 
+// Calculate gravity for every body.
 void accel(Sim& b) {
     const size_t n = b.n;
     const double eps2 = SOFTENING * SOFTENING;
@@ -112,6 +113,7 @@ void accel(Sim& b) {
     }
 }
 
+// Measure simulation energy.
 double energy(const Sim& b) {
     const size_t n = b.n;
     const double eps2 = SOFTENING * SOFTENING;
@@ -140,6 +142,7 @@ double energy(const Sim& b) {
     return kin + pot;
 }
 
+// Advance one stable simulation step.
 void step(Sim& b, double dt) {
     const long n = static_cast<long>(b.n);
     const double h = 0.5 * dt;
@@ -202,9 +205,10 @@ void step(Sim& b, double dt) {
     }
 }
 
+// Save positions for later analysis.
 void dump(const Sim& b, int frame) {
     char name[64];
-    std::snprintf(name, sizeof name, "snapshots/frame_%04d.csv", frame);
+    std::snprintf(name,sizeof name,"snapshots/frame_%04d.csv",frame);
     FILE* f = std::fopen(name, "w");
     if (!f) { std::perror(name); return; }
     std::fprintf(f, "x,y,z\n");
@@ -214,6 +218,7 @@ void dump(const Sim& b, int frame) {
 }
 
 #ifdef _WIN32
+// UI data is separate from the physics data.
 struct Viz {
     Sim& bodies;
     std::unique_ptr<double[]> x;
@@ -422,6 +427,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
                 const size_t stride = shown == 0
                     ? 1
                     : std::max<size_t>(1, (want + shown - 1) / shown);
+                // Use points for dense views.
                 if (shown <= 4000) {
                     HPEN trail_pen = CreatePen(PS_SOLID, 1, RGB(35, 55, 100));
                     HGDIOBJ old_particle_pen = SelectObject(draw_dc, trail_pen);
@@ -542,6 +548,7 @@ int run_viz(Sim& bodies, double dt, int nth) {
                         bodies.n, bodies.n};
     sync_view(view);
 
+    // Leave one thread for the UI.
     std::thread simulation([&view, dt, nth] {
         omp_set_num_threads(std::max(1, nth - 1));
         while (!view.stop) {
@@ -612,6 +619,7 @@ int run_viz(Sim& bodies, double dt, int nth) {
 #endif
 
 int main(int argc, char** argv) {
+    // Read options from the command line.
     size_t N        = argc > 1 ? std::strtoul(argv[1], nullptr, 10) : 10000;
     int nstep       = argc > 2 ? std::atoi(argv[2]) : 200;
     double dt       = argc > 3 ? std::atof(argv[3]) : 0.001;
