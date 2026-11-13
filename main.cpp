@@ -1,16 +1,3 @@
-// Parallel N-body gravity simulation (O(N^2) direct summation) using OpenMP.
-//
-// Build:  g++ -O3 -march=native -fopenmp -std=c++17 nbody.cpp -o nbody
-// Run:    untitled.exe [N=10000] [steps=200] [dt=0.001] [threads=all] [snapshot_every=0]
-//         Add --headless as the sixth argument to run without the window.
-//
-// If snapshot_every > 0, positions are written to snapshots/frame_XXXX.csv
-// (create the folder first: mkdir snapshots).
-//
-// Units: G = 1. A heavy central body with light particles on roughly
-// circular orbits in a disk (a toy "solar system / galaxy").
-// Integrator: kick-drift-kick leapfrog (symplectic, good energy behaviour).
-
 #include <omp.h>
 
 #include <algorithm>
@@ -36,7 +23,6 @@
 
 struct Bodies {
     size_t n = 0;
-    // Structure-of-arrays layout: each array is allocated contiguously.
     std::unique_ptr<double[]> x, y, z, vx, vy, vz, ax, ay, az, m;
 
     explicit Bodies(size_t n_)
@@ -54,7 +40,7 @@ struct Bodies {
 };
 
 constexpr double G = 1.0;
-constexpr double SOFTENING = 0.01;  // avoids singularities in close encounters
+constexpr double SOFTENING = 0.01;
 
 void init_disk(Bodies& b, unsigned seed = 42) {
     std::mt19937_64 rng(seed);
@@ -64,27 +50,24 @@ void init_disk(Bodies& b, unsigned seed = 42) {
     const double M_central = 100.0;
     std::uniform_real_distribution<double> planet_mass(0.005, 0.05);
 
-    // Body 0: central mass at rest
     b.m[0] = M_central;
     b.x[0] = b.y[0] = b.z[0] = 0.0;
     b.vx[0] = b.vy[0] = b.vz[0] = 0.0;
 
     for (size_t i = 1; i < b.n; ++i) {
-        double r = 0.8 + 7.2 * std::sqrt(U(rng));  // radius in [0.8, 8]
+        double r = 0.8 + 7.2 * std::sqrt(U(rng));
         double th = 2.0 * M_PI * U(rng);
         b.m[i] = planet_mass(rng);
         double vc = std::sqrt(G * (M_central + b.m[i]) / r);
 
         b.x[i] = r * std::cos(th);
         b.y[i] = r * std::sin(th);
-        b.z[i] = 0.05 * N01(rng);  // thin disk
-        // tangential velocity + a little dispersion
+        b.z[i] = 0.05 * N01(rng);
         b.vx[i] = -vc * std::sin(th) + 0.02 * vc * N01(rng);
         b.vy[i] =  vc * std::cos(th) + 0.02 * vc * N01(rng);
         b.vz[i] = 0.02 * vc * N01(rng);
     }
 
-    // Shift to centre-of-mass frame so the system doesn't drift
     double px = 0, py = 0, pz = 0, mt = 0;
     for (size_t i = 0; i < b.n; ++i) {
         px += b.m[i] * b.vx[i]; py += b.m[i] * b.vy[i]; pz += b.m[i] * b.vz[i];
@@ -95,9 +78,6 @@ void init_disk(Bodies& b, unsigned seed = 42) {
     }
 }
 
-// Each thread owns a disjoint set of i's and only writes ax[i], ay[i], az[i],
-// so there are no data races. (Using Newton's 3rd law to halve the work would
-// need atomics or per-thread buffers, which usually costs more than it saves.)
 void compute_accel(Bodies& b) {
     const size_t n = b.n;
     const double eps2 = SOFTENING * SOFTENING;
@@ -105,6 +85,9 @@ void compute_accel(Bodies& b) {
     const double* __restrict y = b.y.get();
     const double* __restrict z = b.z.get();
     const double* __restrict m = b.m.get();
+    double* __restrict ax = b.ax.get();
+    double* __restrict ay = b.ay.get();
+    double* __restrict az = b.az.get();
 
 #pragma omp parallel for schedule(static)
     for (long i = 0; i < static_cast<long>(n); ++i) {
@@ -118,54 +101,104 @@ void compute_accel(Bodies& b) {
             double dz = z[j] - zi;
             double r2 = dx * dx + dy * dy + dz * dz + eps2;
             double inv_r = 1.0 / std::sqrt(r2);
-            double s = G * m[j] * inv_r * inv_r * inv_r;  // j == i gives dx = 0 -> no force
+            double s = G * m[j] * inv_r * inv_r * inv_r;
             axi += s * dx;
             ayi += s * dy;
             azi += s * dz;
         }
-        b.ax[i] = axi;
-        b.ay[i] = ayi;
-        b.az[i] = azi;
+        ax[i] = axi;
+        ay[i] = ayi;
+        az[i] = azi;
     }
 }
 
 double total_energy(const Bodies& b) {
     const size_t n = b.n;
     const double eps2 = SOFTENING * SOFTENING;
+    const double* __restrict x = b.x.get();
+    const double* __restrict y = b.y.get();
+    const double* __restrict z = b.z.get();
+    const double* __restrict vx = b.vx.get();
+    const double* __restrict vy = b.vy.get();
+    const double* __restrict vz = b.vz.get();
+    const double* __restrict m = b.m.get();
     double kin = 0.0, pot = 0.0;
 
 #pragma omp parallel for reduction(+ : kin, pot) schedule(static)
     for (long i = 0; i < static_cast<long>(n); ++i) {
-        kin += 0.5 * b.m[i] *
-               (b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i] + b.vz[i] * b.vz[i]);
+        kin += 0.5 * m[i] *
+               (vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]);
         double p = 0.0;
         for (size_t j = i + 1; j < n; ++j) {
-            double dx = b.x[j] - b.x[i];
-            double dy = b.y[j] - b.y[i];
-            double dz = b.z[j] - b.z[i];
-            p -= G * b.m[i] * b.m[j] / std::sqrt(dx * dx + dy * dy + dz * dz + eps2);
+            double dx = x[j] - x[i];
+            double dy = y[j] - y[i];
+            double dz = z[j] - z[i];
+            p -= G * m[i] * m[j] / std::sqrt(dx * dx + dy * dy + dz * dz + eps2);
         }
         pot += p;
     }
     return kin + pot;
 }
 
-// Kick-drift-kick leapfrog
 void step(Bodies& b, double dt) {
     const long n = static_cast<long>(b.n);
     const double h = 0.5 * dt;
+    double* __restrict x = b.x.get();
+    double* __restrict y = b.y.get();
+    double* __restrict z = b.z.get();
+    double* __restrict vx = b.vx.get();
+    double* __restrict vy = b.vy.get();
+    double* __restrict vz = b.vz.get();
+    double* __restrict ax = b.ax.get();
+    double* __restrict ay = b.ay.get();
+    double* __restrict az = b.az.get();
+    const double* __restrict m = b.m.get();
+    const double eps2 = SOFTENING * SOFTENING;
 
-#pragma omp parallel for schedule(static)
-    for (long i = 0; i < n; ++i) {  // half kick + drift
-        b.vx[i] += b.ax[i] * h; b.vy[i] += b.ay[i] * h; b.vz[i] += b.az[i] * h;
-        b.x[i] += b.vx[i] * dt; b.y[i] += b.vy[i] * dt; b.z[i] += b.vz[i] * dt;
-    }
+#pragma omp parallel
+    {
+#pragma omp for schedule(static)
+        for (long i = 0; i < n; ++i) {
+            vx[i] += ax[i] * h;
+            vy[i] += ay[i] * h;
+            vz[i] += az[i] * h;
+            x[i] += vx[i] * dt;
+            y[i] += vy[i] * dt;
+            z[i] += vz[i] * dt;
+        }
 
-    compute_accel(b);
+#pragma omp for schedule(static)
+        for (long i = 0; i < n; ++i) {
+            double axi = 0.0;
+            double ayi = 0.0;
+            double azi = 0.0;
+            const double xi = x[i];
+            const double yi = y[i];
+            const double zi = z[i];
 
-#pragma omp parallel for schedule(static)
-    for (long i = 0; i < n; ++i) {  // second half kick
-        b.vx[i] += b.ax[i] * h; b.vy[i] += b.ay[i] * h; b.vz[i] += b.az[i] * h;
+#pragma omp simd reduction(+ : axi, ayi, azi)
+            for (size_t j = 0; j < static_cast<size_t>(n); ++j) {
+                const double dx = x[j] - xi;
+                const double dy = y[j] - yi;
+                const double dz = z[j] - zi;
+                const double r2 = dx * dx + dy * dy + dz * dz + eps2;
+                const double inv_r = 1.0 / std::sqrt(r2);
+                const double s = G * m[j] * inv_r * inv_r * inv_r;
+                axi += s * dx;
+                ayi += s * dy;
+                azi += s * dz;
+            }
+            ax[i] = axi;
+            ay[i] = ayi;
+            az[i] = azi;
+        }
+
+#pragma omp for schedule(static)
+        for (long i = 0; i < n; ++i) {
+            vx[i] += ax[i] * h;
+            vy[i] += ay[i] * h;
+            vz[i] += az[i] * h;
+        }
     }
 }
 
