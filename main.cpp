@@ -21,11 +21,11 @@
 #include <commctrl.h>
 #endif
 
-struct Bodies {
+struct Sim {
     size_t n = 0;
     std::unique_ptr<double[]> x, y, z, vx, vy, vz, ax, ay, az, m;
 
-    explicit Bodies(size_t n_)
+    explicit Sim(size_t n_)
         : n(n_),
           x(std::make_unique<double[]>(n_)),
           y(std::make_unique<double[]>(n_)),
@@ -42,7 +42,7 @@ struct Bodies {
 constexpr double G = 1.0;
 constexpr double SOFTENING = 0.01;
 
-void init_disk(Bodies& b, unsigned seed = 42) {
+void seed(Sim& b, unsigned seed = 42) {
     std::mt19937_64 rng(seed);
     std::uniform_real_distribution<double> U(0.0, 1.0);
     std::normal_distribution<double> N01(0.0, 1.0);
@@ -78,7 +78,7 @@ void init_disk(Bodies& b, unsigned seed = 42) {
     }
 }
 
-void compute_accel(Bodies& b) {
+void accel(Sim& b) {
     const size_t n = b.n;
     const double eps2 = SOFTENING * SOFTENING;
     const double* __restrict x = b.x.get();
@@ -112,7 +112,7 @@ void compute_accel(Bodies& b) {
     }
 }
 
-double total_energy(const Bodies& b) {
+double energy(const Sim& b) {
     const size_t n = b.n;
     const double eps2 = SOFTENING * SOFTENING;
     const double* __restrict x = b.x.get();
@@ -140,7 +140,7 @@ double total_energy(const Bodies& b) {
     return kin + pot;
 }
 
-void step(Bodies& b, double dt) {
+void step(Sim& b, double dt) {
     const long n = static_cast<long>(b.n);
     const double h = 0.5 * dt;
     double* __restrict x = b.x.get();
@@ -202,7 +202,7 @@ void step(Bodies& b, double dt) {
     }
 }
 
-void write_snapshot(const Bodies& b, int frame) {
+void dump(const Sim& b, int frame) {
     char name[64];
     std::snprintf(name, sizeof name, "snapshots/frame_%04d.csv", frame);
     FILE* f = std::fopen(name, "w");
@@ -214,15 +214,15 @@ void write_snapshot(const Bodies& b, int frame) {
 }
 
 #ifdef _WIN32
-struct Visualization {
-    Bodies& bodies;
+struct Viz {
+    Sim& bodies;
     std::unique_ptr<double[]> x;
     std::unique_ptr<double[]> y;
     std::unique_ptr<double[]> previous_x;
     std::unique_ptr<double[]> previous_y;
     std::unique_ptr<double[]> mass;
     size_t count;
-    std::atomic<size_t> visible_count;
+    std::atomic<size_t> shown;
     HWND slider = nullptr;
     HWND speed_slider = nullptr;
     HWND zoom_slider = nullptr;
@@ -238,7 +238,7 @@ struct Visualization {
     std::atomic<bool> stop = false;
 };
 
-void publish_positions(Visualization& view) {
+void sync_view(Viz& view) {
     std::lock_guard<std::mutex> lock(view.mutex);
     for (size_t i = 0; i < view.count; ++i) {
         view.x[i] = view.bodies.x[i];
@@ -250,12 +250,12 @@ void publish_positions(Visualization& view) {
     }
 }
 
-LRESULT CALLBACK visualization_window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    auto* view = reinterpret_cast<Visualization*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* view = reinterpret_cast<Viz*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
 
     if (message == WM_NCCREATE) {
         auto* create = reinterpret_cast<CREATESTRUCT*>(lParam);
-        view = static_cast<Visualization*>(create->lpCreateParams);
+        view = static_cast<Viz*>(create->lpCreateParams);
         SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(view));
     }
 
@@ -336,7 +336,7 @@ LRESULT CALLBACK visualization_window_proc(HWND hwnd, UINT message, WPARAM wPara
             if (view != nullptr && reinterpret_cast<HWND>(lParam) == view->slider) {
                 const size_t selected = static_cast<size_t>(
                     SendMessage(view->slider, TBM_GETPOS, 0, 0));
-                view->visible_count = selected;
+                view->shown = selected;
                 char text[64];
                 std::snprintf(text, sizeof text, "Particles: %zu", selected);
                 SetWindowTextA(view->count_label, text);
@@ -416,38 +416,77 @@ LRESULT CALLBACK visualization_window_proc(HWND hwnd, UINT message, WPARAM wPara
                 SelectObject(draw_dc, old_pen);
                 DeleteObject(orbit_pen);
 
+                const size_t want = std::min(view->shown.load(), view->count);
+                constexpr size_t cap = 50000;
+                const size_t shown = std::min(want, cap);
+                const size_t stride = shown == 0
+                    ? 1
+                    : std::max<size_t>(1, (want + shown - 1) / shown);
+                if (shown <= 4000) {
+                    HPEN trail_pen = CreatePen(PS_SOLID, 1, RGB(35, 55, 100));
+                    HGDIOBJ old_particle_pen = SelectObject(draw_dc, trail_pen);
+                    for (size_t i = 1; i < want; i += stride) {
+                        const int px = static_cast<int>(center_x + view->x[i] * scale);
+                        const int py = static_cast<int>(center_y - view->y[i] * scale);
+                        const int previous_px = static_cast<int>(center_x + view->previous_x[i] * scale);
+                        const int previous_py = static_cast<int>(center_y - view->previous_y[i] * scale);
+                        MoveToEx(draw_dc, previous_px, previous_py, nullptr);
+                        LineTo(draw_dc, px, py);
+                    }
+                    SelectObject(draw_dc, old_particle_pen);
+                    DeleteObject(trail_pen);
+                }
+
                 HBRUSH white_star_brush = CreateSolidBrush(RGB(240, 245, 255));
                 HBRUSH blue_star_brush = CreateSolidBrush(RGB(180, 210, 255));
                 HBRUSH orange_star_brush = CreateSolidBrush(RGB(255, 190, 100));
-                HPEN trail_pen = CreatePen(PS_SOLID, 1, RGB(35, 55, 100));
                 old_brush = SelectObject(draw_dc, white_star_brush);
-
-                const size_t visible_count = std::min(view->visible_count.load(), view->count);
-                for (size_t i = 1; i < visible_count; ++i) {
+                for (size_t i = 1; i < want; i += stride) {
+                    if (i % 5 == 0 || i % 3 == 0) continue;
                     const int px = static_cast<int>(center_x + view->x[i] * scale);
                     const int py = static_cast<int>(center_y - view->y[i] * scale);
-                    const int previous_px = static_cast<int>(center_x + view->previous_x[i] * scale);
-                    const int previous_py = static_cast<int>(center_y - view->previous_y[i] * scale);
-                    HGDIOBJ old_particle_pen = SelectObject(draw_dc, trail_pen);
-                    MoveToEx(draw_dc, previous_px, previous_py, nullptr);
-                    LineTo(draw_dc, px, py);
-                    SelectObject(draw_dc, old_particle_pen);
-
-                    const double mass = view->mass[i];
-                    HBRUSH star_brush = (i % 5 == 0) ? orange_star_brush
-                        : (i % 3 == 0) ? blue_star_brush : white_star_brush;
-                    HGDIOBJ old_star_brush = SelectObject(draw_dc, star_brush);
-                    const int radius = std::clamp(
-                        2 + static_cast<int>(std::sqrt(mass) * 10.0), 2, 5);
-                    Ellipse(draw_dc, px - radius, py - radius, px + radius + 1, py + radius + 1);
-                    SelectObject(draw_dc, old_star_brush);
+                    if (shown > 4000) {
+                        SetPixelV(draw_dc, px, py, RGB(240, 245, 255));
+                    } else {
+                        const int radius = std::clamp(
+                            2 + static_cast<int>(std::sqrt(view->mass[i]) * 10.0), 2, 5);
+                        Ellipse(draw_dc, px - radius, py - radius, px + radius + 1, py + radius + 1);
+                    }
                 }
-
+                SelectObject(draw_dc, blue_star_brush);
+                for (size_t i = 1; i < want; i += stride) {
+                    if (i % 5 != 0 && i % 3 == 0) {
+                        const int px = static_cast<int>(center_x + view->x[i] * scale);
+                        const int py = static_cast<int>(center_y - view->y[i] * scale);
+                        if (shown > 4000) {
+                            SetPixelV(draw_dc, px, py, RGB(180, 210, 255));
+                        } else {
+                            const int radius = std::clamp(
+                                2 + static_cast<int>(std::sqrt(view->mass[i]) * 10.0), 2, 5);
+                            Ellipse(draw_dc, px - radius, py - radius,
+                                    px + radius + 1, py + radius + 1);
+                        }
+                    }
+                }
+                SelectObject(draw_dc, orange_star_brush);
+                for (size_t i = 1; i < want; i += stride) {
+                    if (i % 5 == 0) {
+                        const int px = static_cast<int>(center_x + view->x[i] * scale);
+                        const int py = static_cast<int>(center_y - view->y[i] * scale);
+                        if (shown > 4000) {
+                            SetPixelV(draw_dc, px, py, RGB(255, 190, 100));
+                        } else {
+                            const int radius = std::clamp(
+                                2 + static_cast<int>(std::sqrt(view->mass[i]) * 10.0), 2, 5);
+                            Ellipse(draw_dc, px - radius, py - radius,
+                                    px + radius + 1, py + radius + 1);
+                        }
+                    }
+                }
                 SelectObject(draw_dc, old_brush);
                 DeleteObject(white_star_brush);
                 DeleteObject(blue_star_brush);
                 DeleteObject(orange_star_brush);
-                DeleteObject(trail_pen);
                 HBRUSH sun_glow = CreateSolidBrush(RGB(120, 55, 15));
                 HBRUSH sun = CreateSolidBrush(RGB(255, 190, 45));
                 const int glow_radius = 18;
@@ -494,17 +533,17 @@ LRESULT CALLBACK visualization_window_proc(HWND hwnd, UINT message, WPARAM wPara
     return DefWindowProc(hwnd, message, wParam, lParam);
 }
 
-int run_visualization(Bodies& bodies, double dt, int threads) {
-    Visualization view{bodies, std::make_unique<double[]>(bodies.n),
+int run_viz(Sim& bodies, double dt, int nth) {
+    Viz view{bodies, std::make_unique<double[]>(bodies.n),
                         std::make_unique<double[]>(bodies.n),
                         std::make_unique<double[]>(bodies.n),
                         std::make_unique<double[]>(bodies.n),
                         std::make_unique<double[]>(bodies.n),
                         bodies.n, bodies.n};
-    publish_positions(view);
+    sync_view(view);
 
-    std::thread simulation([&view, dt, threads] {
-        omp_set_num_threads(threads);
+    std::thread simulation([&view, dt, nth] {
+        omp_set_num_threads(std::max(1, nth - 1));
         while (!view.stop) {
             const auto frame_start = std::chrono::steady_clock::now();
             while (view.paused && !view.stop) std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -512,7 +551,8 @@ int run_visualization(Bodies& bodies, double dt, int threads) {
             step(view.bodies, dt * view.speed_multiplier.load());
             {
                 std::lock_guard<std::mutex> lock(view.mutex);
-                for (size_t i = 0; i < view.count; ++i) {
+                const size_t ncopy = std::min(view.shown.load(), view.count);
+                for (size_t i = 0; i < ncopy; ++i) {
                     view.previous_x[i] = view.x[i];
                     view.previous_y[i] = view.y[i];
                     view.x[i] = view.bodies.x[i];
@@ -532,7 +572,7 @@ int run_visualization(Bodies& bodies, double dt, int threads) {
     INITCOMMONCONTROLSEX common_controls{sizeof(INITCOMMONCONTROLSEX), ICC_BAR_CLASSES};
     InitCommonControlsEx(&common_controls);
     WNDCLASSA window_class{};
-    window_class.lpfnWndProc = visualization_window_proc;
+    window_class.lpfnWndProc = wnd_proc;
     window_class.style = CS_HREDRAW | CS_VREDRAW;
     window_class.hInstance = GetModuleHandle(nullptr);
     window_class.hCursor = LoadCursor(nullptr, IDC_ARROW);
@@ -573,10 +613,10 @@ int run_visualization(Bodies& bodies, double dt, int threads) {
 
 int main(int argc, char** argv) {
     size_t N        = argc > 1 ? std::strtoul(argv[1], nullptr, 10) : 10000;
-    int steps       = argc > 2 ? std::atoi(argv[2]) : 200;
+    int nstep       = argc > 2 ? std::atoi(argv[2]) : 200;
     double dt       = argc > 3 ? std::atof(argv[3]) : 0.001;
-    int threads     = argc > 4 ? std::atoi(argv[4]) : omp_get_max_threads();
-    int snap_every  = argc > 5 ? std::atoi(argv[5]) : 0;
+    int nth     = argc > 4 ? std::atoi(argv[4]) : omp_get_max_threads();
+    int snap  = argc > 5 ? std::atoi(argv[5]) : 0;
 #ifdef _WIN32
     const bool visualize = argc <= 6 || std::string(argv[6]) != "--headless";
 #else
@@ -588,33 +628,33 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    omp_set_num_threads(threads);
-    std::printf("N=%zu steps=%d dt=%g threads=%d\n", N, steps, dt, threads);
+    omp_set_num_threads(nth);
+    std::printf("N=%zu nstep=%d dt=%g nth=%d\n", N, nstep, dt, nth);
 
-    Bodies b(N);
-    init_disk(b);
-    compute_accel(b);
+    Sim b(N);
+    seed(b);
+    accel(b);
 
-    const double E0 = total_energy(b);
+    const double E0 = energy(b);
     std::printf("Initial energy: %.8f\n", E0);
 
 #ifdef _WIN32
-    if (visualize) return run_visualization(b, dt, threads);
+    if (visualize) return run_viz(b, dt, nth);
 #endif
 
     auto t0 = std::chrono::steady_clock::now();
-    for (int s = 1; s <= steps; ++s) {
+    for (int s = 1; s <= nstep; ++s) {
         step(b, dt);
-        if (snap_every > 0 && s % snap_every == 0) write_snapshot(b, s / snap_every);
-        if (s % std::max(1, steps / 10) == 0) {
-            double E = total_energy(b);
+        if (snap > 0 && s % snap == 0) dump(b, s / snap);
+        if (s % std::max(1, nstep / 10) == 0) {
+            double E = energy(b);
             std::printf("step %6d  E=%.8f  rel.drift=%.3e\n", s, E, std::abs((E - E0) / E0));
         }
     }
     auto t1 = std::chrono::steady_clock::now();
 
     double secs = std::chrono::duration<double>(t1 - t0).count();
-    double interactions = static_cast<double>(N) * N * steps;
+    double interactions = static_cast<double>(N) * N * nstep;
     std::printf("Time: %.3f s  (%.2f G interactions/s)\n", secs, interactions / secs / 1e9);
     return 0;
 }
